@@ -1,0 +1,24 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Базовые разрешения для главного окна Aegis",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-is-minimized",
+    "core:window:allow-minimize",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://api.pwnedpasswords.com/*" },
+        { "url": "https://*/favicon.ico" },
+        { "url": "https://www.google.com/s2/favicons*" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+name: Release
+
+# Собирает установщики Aegis под Windows, macOS (Intel + Apple Silicon) и Linux.
+# Запускается при пуше тега вида v1.0.0 или вручную из вкладки Actions.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest          # Apple Silicon (arm64)
+            target: aarch64-apple-darwin
+          - platform: macos-latest          # Intel (x86_64)
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            target: ""
+          - platform: windows-latest
+            target: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка зависимостей Linux (WebKitGTK)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Кэш Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Установка npm-зависимостей
+        run: npm ci
+
+      - name: Сборка и публикация
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Aegis ${{ github.ref_name }}"
+          releaseBody: "Установщики Aegis под Windows, macOS и Linux."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
