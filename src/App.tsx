@@ -35,6 +35,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<{ entry: Entry | null; kind: EntryKind } | null>(null);
   const [toast, setToast] = useState("");
+  const [wipedNotice, setWipedNotice] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<number | null>(null);
 
@@ -52,11 +53,21 @@ export default function App() {
   }, []);
 
   const onUnlocked = async (list: Entry[]) => {
+    setWipedNotice("");
     setEntries(sortEntries(list));
     setSelectedId(list.length ? sortEntries(list)[0].id : null);
     try { setSettings(await api.getSettings()); } catch { /* */ }
     setView("all");
     setScreen("unlocked");
+  };
+
+  const onWiped = () => {
+    setWipedNotice(
+      "Все данные приложения удалены из-за многократного неверного ввода мастер-пароля. Создайте новое хранилище."
+    );
+    setEntries([]);
+    setSelectedId(null);
+    setScreen("setup");
   };
 
   const lock = useCallback(async () => {
@@ -192,7 +203,14 @@ export default function App() {
 
   if (screen === "loading") return <div className="splash"><Shield width={44} height={44} /></div>;
   if (screen === "setup" || screen === "locked")
-    return <LockScreen isNew={screen === "setup"} onUnlocked={onUnlocked} />;
+    return (
+      <LockScreen
+        isNew={screen === "setup"}
+        notice={wipedNotice}
+        onUnlocked={onUnlocked}
+        onWiped={onWiped}
+      />
+    );
 
   const isListView = view === "all" || view === "favorites" || view === "login" || view === "crypto";
 

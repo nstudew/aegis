@@ -1,14 +1,17 @@
 mod crypto;
 mod error;
+mod guard;
 mod vault;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use serde::Serialize;
 use tauri::{Manager, State};
 
 use crypto::MasterKey;
 use error::AegisError;
+use guard::{Guard, Outcome};
 use vault::{Entry, GenOptions, Settings, VaultData};
 
 /// Разблокированное состояние, живущее только в памяти процесса.
@@ -30,6 +33,56 @@ fn vault_path(app: &tauri::AppHandle) -> Result<PathBuf, AegisError> {
         .app_data_dir()
         .map_err(|e| AegisError::Internal(e.to_string()))?;
     Ok(dir.join("vault.aegis"))
+}
+
+/// Путь к файлу состояния защиты от перебора.
+fn guard_path(app: &tauri::AppHandle) -> Result<PathBuf, AegisError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AegisError::Internal(e.to_string()))?;
+    Ok(dir.join("guard.json"))
+}
+
+fn read_guard(path: &Path) -> Guard {
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_guard(path: &Path, g: &Guard) -> Result<(), AegisError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(g).map_err(|e| AegisError::Internal(e.to_string()))?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// Полное удаление данных приложения (хранилище + состояние защиты).
+fn wipe_all(vault: &Path, guard: &Path) {
+    std::fs::remove_file(vault).ok();
+    std::fs::remove_file(guard).ok();
+}
+
+/// Ответ команды разблокировки. Сериализуется как { "status": "...", ... }.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum UnlockResponse {
+    Ok { entries: Vec<Entry> },
+    Wrong { attempts_left: u32, next: String },
+    Locked { remaining_secs: u64 },
+    Wiped,
+}
+
+/// Текущий статус защиты для интерфейса.
+#[derive(Serialize)]
+struct GuardStatus {
+    locked: bool,
+    remaining_secs: u64,
+    attempts_left: u32,
+    next: String,
 }
 
 /// Данные записи, приходящие с фронтенда (без служебных полей).
@@ -85,6 +138,8 @@ fn create_vault(
     }
     let path = vault_path(&app)?;
     let (key, data) = vault::create(&path, &master_password)?;
+    // Новое хранилище - сбрасываем счётчик защиты.
+    std::fs::remove_file(guard_path(&app)?).ok();
     let entries = data.entries.clone();
     *state.inner.lock().unwrap() = Some(Unlocked { key, data });
     Ok(entries)
@@ -95,12 +150,59 @@ fn unlock(
     app: tauri::AppHandle,
     state: State<AppState>,
     master_password: String,
-) -> Result<Vec<Entry>, AegisError> {
-    let path = vault_path(&app)?;
-    let (key, data) = vault::open(&path, &master_password)?;
-    let entries = data.entries.clone();
-    *state.inner.lock().unwrap() = Some(Unlocked { key, data });
-    Ok(entries)
+) -> Result<UnlockResponse, AegisError> {
+    let vpath = vault_path(&app)?;
+    let gpath = guard_path(&app)?;
+    let mut g = read_guard(&gpath);
+    let now = vault::now_ms();
+
+    // Уже под блокировкой - даже не пробуем пароль.
+    if let Some(remaining_secs) = g.locked_remaining(now) {
+        return Ok(UnlockResponse::Locked { remaining_secs });
+    }
+
+    match vault::open(&vpath, &master_password) {
+        Ok((key, data)) => {
+            g.reset();
+            write_guard(&gpath, &g)?;
+            let entries = data.entries.clone();
+            *state.inner.lock().unwrap() = Some(Unlocked { key, data });
+            Ok(UnlockResponse::Ok { entries })
+        }
+        Err(AegisError::WrongPassword) => match g.register_failure(now) {
+            Outcome::Wiped => {
+                wipe_all(&vpath, &gpath);
+                *state.inner.lock().unwrap() = None;
+                Ok(UnlockResponse::Wiped)
+            }
+            Outcome::Locked { remaining_secs } => {
+                write_guard(&gpath, &g)?;
+                Ok(UnlockResponse::Locked { remaining_secs })
+            }
+            Outcome::Wrong { attempts_left, next } => {
+                write_guard(&gpath, &g)?;
+                Ok(UnlockResponse::Wrong {
+                    attempts_left,
+                    next: next.as_str().to_string(),
+                })
+            }
+            Outcome::Ok => unreachable!("register_failure never returns Ok"),
+        },
+        // Прочие ошибки (нет файла, повреждён) не считаются неверным паролем.
+        Err(e) => Err(e),
+    }
+}
+
+#[tauri::command]
+fn guard_status(app: tauri::AppHandle) -> Result<GuardStatus, AegisError> {
+    let g = read_guard(&guard_path(&app)?);
+    let (locked, remaining_secs, attempts_left, next) = g.status(vault::now_ms());
+    Ok(GuardStatus {
+        locked,
+        remaining_secs,
+        attempts_left,
+        next: next.as_str().to_string(),
+    })
 }
 
 #[tauri::command]
@@ -316,6 +418,68 @@ fn import_vault(
     Ok(())
 }
 
+#[cfg(test)]
+mod integration {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("aegis_test_{}_{}", std::process::id(), name));
+        d
+    }
+
+    #[test]
+    fn guard_io_vault_and_wipe() {
+        let gp = tmp("guard.json");
+        let vp = tmp("vault.aegis");
+        std::fs::remove_file(&gp).ok();
+        std::fs::remove_file(&vp).ok();
+
+        // По умолчанию счётчик пуст; запись и чтение совпадают.
+        assert_eq!(read_guard(&gp), Guard::default());
+        let mut g = Guard::default();
+        g.register_failure(0);
+        write_guard(&gp, &g).unwrap();
+        assert_eq!(read_guard(&gp).failed, 1);
+
+        // Хранилище: верный/неверный пароль различаются.
+        vault::create(&vp, "correct horse battery").unwrap();
+        assert!(matches!(
+            vault::open(&vp, "wrong"),
+            Err(AegisError::WrongPassword)
+        ));
+        assert!(vault::open(&vp, "correct horse battery").is_ok());
+
+        // Полное удаление убирает оба файла.
+        wipe_all(&vp, &gp);
+        assert!(!vp.exists());
+        assert!(!gp.exists());
+    }
+
+    #[test]
+    fn unlock_response_json_contract() {
+        let wrong = serde_json::to_string(&UnlockResponse::Wrong {
+            attempts_left: 2,
+            next: "wipe".into(),
+        })
+        .unwrap();
+        assert!(wrong.contains("\"status\":\"wrong\""));
+        assert!(wrong.contains("\"attempts_left\":2"));
+        assert!(wrong.contains("\"next\":\"wipe\""));
+
+        assert_eq!(
+            serde_json::to_string(&UnlockResponse::Wiped).unwrap(),
+            "{\"status\":\"wiped\"}"
+        );
+
+        let locked = serde_json::to_string(&UnlockResponse::Locked { remaining_secs: 1800 }).unwrap();
+        assert!(locked.contains("\"status\":\"locked\"") && locked.contains("\"remaining_secs\":1800"));
+
+        let ok = serde_json::to_string(&UnlockResponse::Ok { entries: vec![] }).unwrap();
+        assert!(ok.contains("\"status\":\"ok\"") && ok.contains("\"entries\":[]"));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -328,6 +492,7 @@ pub fn run() {
             is_unlocked,
             create_vault,
             unlock,
+            guard_status,
             lock,
             list_entries,
             add_entry,

@@ -40,6 +40,19 @@ export interface GenOptions {
   exclude_ambiguous: boolean;
 }
 
+export type UnlockResponse =
+  | { status: "ok"; entries: Entry[] }
+  | { status: "wrong"; attempts_left: number; next: "lockout" | "wipe" }
+  | { status: "locked"; remaining_secs: number }
+  | { status: "wiped" };
+
+export interface GuardStatus {
+  locked: boolean;
+  remaining_secs: number;
+  attempts_left: number;
+  next: "lockout" | "wipe";
+}
+
 export interface Settings {
   auto_lock_secs: number;
   clipboard_clear_secs: number;
@@ -71,7 +84,8 @@ export const api = {
   createVault: (masterPassword: string) =>
     invoke<Entry[]>("create_vault", { masterPassword }),
   unlock: (masterPassword: string) =>
-    invoke<Entry[]>("unlock", { masterPassword }),
+    invoke<UnlockResponse>("unlock", { masterPassword }),
+  guardStatus: () => invoke<GuardStatus>("guard_status"),
   lock: () => invoke<void>("lock"),
   listEntries: () => invoke<Entry[]>("list_entries"),
   addEntry: (input: EntryInput) => invoke<Entry>("add_entry", { input }),
